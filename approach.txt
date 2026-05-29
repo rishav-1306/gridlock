@@ -1,0 +1,80 @@
+========================================================================
+🚦 Gridlock Traffic Demand Prediction - Solution Approach Document
+========================================================================
+
+1. INTRODUCTION & COMPETITION OVERVIEW
+-------------------------------------
+The goal of this competition is to predict normalized traffic demand ("demand" column)
+for a series of spatial-temporal coordinates. 
+The evaluation metric is R2-Score, scaled as:
+  Score = max(0, 100 * R2(actual, predicted))
+
+Based on our exploratory data analysis (EDA):
+- The training set contains complete Day 48 records (all 96 timestamps in 15-min intervals)
+  and early morning Day 49 records (timestamps 0:00 to 2:00, 9 slots).
+- The test set contains targets for the rest of Day 49 (timestamps 2:15 to 13:45, 47 slots).
+- This is a sequential multi-step same-day traffic forecasting problem.
+
+
+2. KEY MODELING ARCHITECTURE
+---------------------------
+To maximize the R2 score, we developed a state-of-the-art stacking ensemble:
+- Level 1 Models:
+  1. LightGBM Regressor (OOF Score: 98.59)
+  2. XGBoost Regressor (OOF Score: 98.69)
+  3. CatBoost Regressor (OOF Score: 98.90)
+- Level 2 Meta-Learner:
+  - Ridge Regression Regressor (Overall Stacked OOF Score: 98.90)
+- Validation Strategy:
+  - 5-Fold Cross-Validation (KFold) to ensure spatial and temporal generalization.
+
+
+3. FEATURE ENGINEERING HIGHLIGHTS
+--------------------------------
+The features engineered to achieve this score are detailed below (sorted by importance):
+
+- Spatial Nearest-Neighbor Imputation (Cold Start Resolution):
+  - The test set contains 10 unseen geohashes. All geohash cells were decoded into continuous 
+    latitude/longitude coordinates. Unseen geohashes were mapped to their closest training 
+    neighbor spatially (distance < 500 meters) to inherit their high-quality daily lag profiles.
+- Spatial Spillover Feature:
+  - Traffic in one grid cell spills into surrounding grid cells. We precomputed the 3 closest 
+    training geohashes for all cells and engineered a `d48_lag0_spatial_mean` feature, which 
+    calculates the average demand of the 3 closest geohashes at that specific timestamp.
+- Exact Daily Lag demand:
+  - We look up demand for the exact same geohash and time slot on Day 48 (`d48_lag0`).
+- Neighborhood Lag demand:
+  - Demand at shifted time slots (lags of +/-15, +/-30, +/-60, +/-90 mins) from Day 48 and early Day 49.
+- Cyclical Temporal Encodings:
+  - Sin and Cos encodings of the minutes-since-midnight representation of the timestamp.
+- Smart Imputations:
+  - Missing temperatures are filled with group averages by timestamp + weather (preserving covariance).
+  - Missing RoadTypes are imputed using the geohash mode.
+
+
+4. TOOLS & LIBRARIES USED
+-------------------------
+- Language: Python 3.11
+- Libraries:
+  - Data Processing: pandas, numpy, scikit-learn
+  - Spatial Decoding: pygeohash
+  - Modeling: lightgbm, xgboost, catboost
+
+
+5. SUBMISSION INTEGRITY VERIFICATION
+-----------------------------------
+- Row Count: Exactly 41,778 rows (matching test.csv).
+- Columns: Exactly "Index" and "demand" columns.
+- Null Safety: Verified 0 missing or NaN values.
+- Prediction Bounds: Clipped to [0.0, 1.0] (matching the normalized demand distribution).
+- Index Alignment: 100% matches test.csv.
+
+
+6. FILE STRUCTURE & SUBMISSION ZIP CONTENTS
+-------------------------------------------
+The final submission archive should be compiled consisting of:
+- approach.txt                      (This approach explanation file)
+- traffic_demand_prediction.ipynb   (Clean reproducible Jupyter notebook)
+- train.py                          (Reproducible python script)
+- submission.csv                    (Verified stacking ensemble predictions)
+========================================================================

@@ -1,0 +1,8 @@
+catboost_info/
+submission_v2.csv
+make_nb.py
+train.py
+submission_source.zip
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

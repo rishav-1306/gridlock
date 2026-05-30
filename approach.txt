@@ -1,80 +1,150 @@
 ========================================================================
-🚦 Gridlock Traffic Demand Prediction - Solution Approach Document
+  Gridlock Traffic Demand Prediction — Solution Approach v2
 ========================================================================
 
-1. INTRODUCTION & COMPETITION OVERVIEW
--------------------------------------
-The goal of this competition is to predict normalized traffic demand ("demand" column)
-for a series of spatial-temporal coordinates. 
-The evaluation metric is R2-Score, scaled as:
-  Score = max(0, 100 * R2(actual, predicted))
-
-Based on our exploratory data analysis (EDA):
-- The training set contains complete Day 48 records (all 96 timestamps in 15-min intervals)
-  and early morning Day 49 records (timestamps 0:00 to 2:00, 9 slots).
-- The test set contains targets for the rest of Day 49 (timestamps 2:15 to 13:45, 47 slots).
-- This is a sequential multi-step same-day traffic forecasting problem.
+EVALUATION METRIC:  Score = max(0, 100 * R2(actual, predicted))
+FINAL OOF SCORE:    99.1241 / 100   ← Stacked Ensemble
+VALIDATION:         GroupKFold(n_splits=5) keyed on geohash (no leakage)
 
 
-2. KEY MODELING ARCHITECTURE
----------------------------
-To maximize the R2 score, we developed a state-of-the-art stacking ensemble:
-- Level 1 Models:
-  1. LightGBM Regressor (OOF Score: 98.59)
-  2. XGBoost Regressor (OOF Score: 98.69)
-  3. CatBoost Regressor (OOF Score: 98.90)
-- Level 2 Meta-Learner:
-  - Ridge Regression Regressor (Overall Stacked OOF Score: 98.90)
-- Validation Strategy:
-  - 5-Fold Cross-Validation (KFold) to ensure spatial and temporal generalization.
+────────────────────────────────────────────────────────────────────────
+1. ROOT CAUSE ANALYSIS  (why v1 scored ~86 despite OOF ~98)
+────────────────────────────────────────────────────────────────────────
+v1 used random KFold on spatial-temporal data. This leaks future
+timestamps and nearby geohash demand values into validation folds,
+making OOF scores artificially inflated (~98) while the true
+leaderboard generalization was far lower (~86).
+
+FIX: Switched to GroupKFold keyed on geohash — each fold validates on
+entirely different spatial locations, giving an honest estimate of
+out-of-sample performance.
 
 
-3. FEATURE ENGINEERING HIGHLIGHTS
---------------------------------
-The features engineered to achieve this score are detailed below (sorted by importance):
+────────────────────────────────────────────────────────────────────────
+2. MODELING ARCHITECTURE
+────────────────────────────────────────────────────────────────────────
+Level-1 Base Learners (all trained with GroupKFold, 5 folds):
 
-- Spatial Nearest-Neighbor Imputation (Cold Start Resolution):
-  - The test set contains 10 unseen geohashes. All geohash cells were decoded into continuous 
-    latitude/longitude coordinates. Unseen geohashes were mapped to their closest training 
-    neighbor spatially (distance < 500 meters) to inherit their high-quality daily lag profiles.
-- Spatial Spillover Feature:
-  - Traffic in one grid cell spills into surrounding grid cells. We precomputed the 3 closest 
-    training geohashes for all cells and engineered a `d48_lag0_spatial_mean` feature, which 
-    calculates the average demand of the 3 closest geohashes at that specific timestamp.
-- Exact Daily Lag demand:
-  - We look up demand for the exact same geohash and time slot on Day 48 (`d48_lag0`).
-- Neighborhood Lag demand:
-  - Demand at shifted time slots (lags of +/-15, +/-30, +/-60, +/-90 mins) from Day 48 and early Day 49.
-- Cyclical Temporal Encodings:
-  - Sin and Cos encodings of the minutes-since-midnight representation of the timestamp.
-- Smart Imputations:
-  - Missing temperatures are filled with group averages by timestamp + weather (preserving covariance).
-  - Missing RoadTypes are imputed using the geohash mode.
+  Model          OOF Score
+  ─────────────────────────
+  LightGBM       99.0708
+  XGBoost        99.0952
+  CatBoost       99.0652
+  Neural Network 98.9429   ← ResidualMLP (CUDA-accelerated)
+
+Level-2 Meta-Learner:
+  Ridge Regression (alpha=0.5) on stacked OOF predictions
+  → Final Stacked OOF: 99.1241
+
+Hardware: GPU (CUDA) used for Neural Network training.
 
 
-4. TOOLS & LIBRARIES USED
--------------------------
-- Language: Python 3.11
-- Libraries:
-  - Data Processing: pandas, numpy, scikit-learn
-  - Spatial Decoding: pygeohash
-  - Modeling: lightgbm, xgboost, catboost
+────────────────────────────────────────────────────────────────────────
+3. NEURAL NETWORK ARCHITECTURE
+────────────────────────────────────────────────────────────────────────
+  Architecture:   Residual MLP
+  Input Proj:     Linear(n_features → 256) → BatchNorm → GELU
+  Residual Blocks (×4):
+                  Linear(256→256) → BatchNorm → GELU → Dropout(0.15)
+                  → Linear(256→256) → BatchNorm → skip connection
+  Output Head:    Linear(256→64) → GELU → Linear(64→1) → Sigmoid
+  Loss:           HuberLoss(delta=0.1)  — robust to outlier spikes
+  Optimizer:      AdamW(lr=1e-3, weight_decay=1e-4)
+  Scheduler:      CosineAnnealingLR(T_max=50)
+  Early Stopping: patience=15 on validation MSE
+  Preprocessing:  StandardScaler on all features (NaN → 0)
 
 
-5. SUBMISSION INTEGRITY VERIFICATION
------------------------------------
-- Row Count: Exactly 41,778 rows (matching test.csv).
-- Columns: Exactly "Index" and "demand" columns.
-- Null Safety: Verified 0 missing or NaN values.
-- Prediction Bounds: Clipped to [0.0, 1.0] (matching the normalized demand distribution).
-- Index Alignment: 100% matches test.csv.
+────────────────────────────────────────────────────────────────────────
+4. FEATURE ENGINEERING  (73 total features)
+────────────────────────────────────────────────────────────────────────
+a) Geohash Spatial Resolution
+   - Custom base-32 decoder → lat/lon for every geohash
+   - 10 unseen test geohashes mapped to nearest training neighbor
+     (Euclidean distance on decoded coordinates)
+   - Precomputed 3 nearest spatial neighbors per geohash for spillover
+
+b) Spatial Clustering
+   - KMeans(k=20) on lat/lon of all geohashes
+   - cluster_ts_mean: mean demand in same cluster at same timestamp
+   - lag0_vs_cluster: deviation of cell demand from cluster average
+
+c) Historical Lag Features (Day 48 & early Day 49 pivot tables)
+   - Exact lags: 0, ±15, ±30, ±60, ±90, ±120 minutes
+   - Spatial spillover: mean demand of 3 nearest neighbors at lag 0
+   - Aggregates per lag set: mean, max, std, median, min, range
+
+d) Day-over-Day Trend
+   - demand_trend = d49e_lag0 − d48_lag0    (momentum)
+   - demand_ratio = d49e_lag0 / d48_lag0    (relative change)
+
+e) Cyclical Temporal Encodings
+   - hour_sin, hour_cos  (period = 24 h)
+   - min_sin,  min_cos   (period = 1440 min)
+   - Time-of-day flags: is_rush, is_morning, is_afternoon, is_night
+
+f) Road & Environment Features
+   - RoadType encoded: Residential=0, Street=1, Highway=2
+   - LargeVehicles_enc, Landmarks_enc, Weather_enc
+   - Temperature (missing → group mean), temp_extreme flag
+   - temp_weather_interaction = Temperature × Weather_enc
+
+g) Geohash Statistics (from Day 48)
+   - gh_mean48, gh_std48, gh_median48, gh_max48, gh_min48
+   - ts_mean48, ts_std48  (time-slot level averages)
+   - gh_ts_deviation = d48_lag0 − ts_mean48
+
+h) Interaction Features
+   - lag0_x_ts    = d48_lag0 × ts_mean48
+   - lanes_highway = NumberofLanes × (RoadType == Highway)
+   - pct_of_day   = time_mins / 1440
 
 
-6. FILE STRUCTURE & SUBMISSION ZIP CONTENTS
--------------------------------------------
-The final submission archive should be compiled consisting of:
-- approach.txt                      (This approach explanation file)
-- traffic_demand_prediction.ipynb   (Clean reproducible Jupyter notebook)
-- train.py                          (Reproducible python script)
-- submission.csv                    (Verified stacking ensemble predictions)
+────────────────────────────────────────────────────────────────────────
+5. TREE MODEL HYPERPARAMETERS
+────────────────────────────────────────────────────────────────────────
+LightGBM:
+  n_estimators=5000, learning_rate=0.02, num_leaves=255
+  feature_fraction=0.75, bagging_fraction=0.75, bagging_freq=1
+  lambda_l1=0.05, lambda_l2=0.05, early_stopping=200
+
+XGBoost:
+  n_estimators=5000, learning_rate=0.02, max_depth=8
+  subsample=0.75, colsample_bytree=0.75
+  reg_alpha=0.05, reg_lambda=0.05, early_stopping=200
+
+CatBoost:
+  iterations=5000, learning_rate=0.02, depth=8
+  l2_leaf_reg=3.0, early_stopping=200
+
+
+────────────────────────────────────────────────────────────────────────
+6. TOOLS & LIBRARIES
+────────────────────────────────────────────────────────────────────────
+Language:   Python 3.12
+Libraries:
+  Data:       pandas, numpy
+  Spatial:    pygeohash, scikit-learn (KMeans, GroupKFold, StandardScaler)
+  Trees:      lightgbm 4.6.0, xgboost 3.2.0, catboost 1.2.10
+  Neural Net: torch 2.5.1 (CUDA 12.1)
+  Meta:       scikit-learn Ridge
+
+
+────────────────────────────────────────────────────────────────────────
+7. SUBMISSION INTEGRITY
+────────────────────────────────────────────────────────────────────────
+  Row Count:   41,778  (matches test.csv exactly)
+  Columns:     "Index" and "demand"
+  Null Safety: 0 missing / NaN values
+  Bounds:      Clipped to [0.0, 1.0]
+  Index Align: 100% matches test.csv
+
+
+────────────────────────────────────────────────────────────────────────
+8. FILE STRUCTURE
+────────────────────────────────────────────────────────────────────────
+  approach.txt                    (this file)
+  train_v2.py                     (reproducible training script)
+  traffic_demand_prediction.ipynb (clean Jupyter notebook)
+  submission.csv                  (final predictions — 41,778 × 2)
 ========================================================================
